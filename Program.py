@@ -5,6 +5,7 @@ ORIGINAL_REPO = "https://github.com/TimeNitch/Tiktok-Streak-Bot-using-cookies"
 """
 
 import json
+from operator import index
 import os
 import re
 import sys
@@ -38,6 +39,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.ini"
 TEXT_FILE = BASE_DIR / "text.txt"
 COOKIE_FILE = BASE_DIR / "cookie.txt"
+EXCEPTION_FILE = BASE_DIR / "exception.txt"
 LOG_FILE = BASE_DIR / "tiktok_bot.log"
 
 DISCORD_WEBHOOK_FILE = BASE_DIR / "discord_webhook.txt"
@@ -181,6 +183,48 @@ def load_optional_secret_text(path: Path) -> str:
 
     text = path.read_text(encoding="utf-8").strip()
     return text
+
+
+def normalize_name_for_compare(name: str) -> str:
+    return " ".join(name.strip().casefold().split())
+
+
+def load_exception_names(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+
+    names = set()
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        names.add(normalize_name_for_compare(line))
+
+    return names
+
+
+def split_targets_by_exception(targets: list[dict]) -> tuple[list[dict], list[dict]]:
+    exception_names = load_exception_names(EXCEPTION_FILE)
+
+    if not exception_names:
+        return targets, []
+
+    allowed_targets = []
+    excluded_targets = []
+
+    for target in targets:
+        target_name = target.get("name", "")
+        normalized_name = normalize_name_for_compare(target_name)
+
+        if normalized_name in exception_names:
+            excluded_targets.append(target)
+        else:
+            allowed_targets.append(target)
+
+    return allowed_targets, excluded_targets
 
 
 def normalize_cookie(cookie: dict) -> dict:
@@ -408,43 +452,107 @@ def find_visible_elements(driver: webdriver.Chrome, xpath: str) -> list:
 def get_target_conversations(driver: webdriver.Chrome) -> list[dict]:
     targets = driver.execute_script(
         """
-        const pinPathD = "M31.6 3.67a3 3 0 0 0-4.24 0l-.7.7";
+        const PIN_PATH_D = "M31.6 3.67a3 3 0 0 0-4.24 0l-.7.7";
 
-        const pinnedItems = [...document.querySelectorAll("path")]
-            .filter(path => path.getAttribute("d")?.startsWith(pinPathD))
-            .map(path => {
-                return path.closest('[data-e2e="dm-new-conversation-item"]')
-                    || path.closest('[data-index]')
-                    || path.closest('div');
-            })
-            .filter(Boolean);
+        const TARGET_CLASS_KEY = "css-k8n8bd";
+        const SKIP_CLASS_KEY = "css-rftu2f";
 
-        const uniqueItems = [];
-        const seen = new Set();
-
-        for (const el of pinnedItems) {
-            const key = el.id || el.getAttribute("data-index") || el.outerHTML.slice(0, 200);
-
-            if (seen.has(key)) {
-                continue;
-            }
-
-            seen.add(key);
-            uniqueItems.push(el);
+        function getConversationName(el) {
+            return el.querySelector('[data-e2e="dm-new-conversation-nickname"]')
+                ?.innerText
+                ?.trim() || "";
         }
 
-        return uniqueItems
-            .map((el, index) => {
-                const nameEl = el.querySelector('[data-e2e="dm-new-conversation-nickname"]');
+        function getConversationMessage(el) {
+            return el.querySelector('[class*="SpanInfoExtract"]')
+                ?.innerText
+                ?.trim() || "";
+        }
 
-                return {
-                    index,
-                    id: el.id || "",
-                    dataIndex: el.getAttribute("data-index") || "",
-                    name: nameEl ? nameEl.textContent.trim() : ""
-                };
-            })
-            .filter(item => item.name);
+        function getConversationTime(el) {
+            return el.querySelector('[class*="SpanInfoTime"]')
+                ?.innerText
+                ?.trim() || "";
+        }
+
+        function getConversationId(el) {
+            return el.getAttribute("data-conv-id")
+                || el.id
+                || el.getAttribute("data-index")
+                || "";
+        }
+
+        function findConversationItemFromPath(path) {
+            return path.closest('[data-e2e="dm-new-conversation-item"]')
+                || path.closest('[data-index]')
+                || path.closest('div');
+        }
+
+        function addUniqueTarget(map, el, source) {
+            if (!el) {
+                return;
+            }
+
+            const name = getConversationName(el);
+
+            if (!name) {
+                return;
+            }
+
+            const convId = getConversationId(el);
+            const dataIndex = el.getAttribute("data-index") || "";
+            const key = convId || dataIndex || name;
+
+            if (!map.has(key)) {
+                map.set(key, {
+                    el,
+                    sources: new Set(),
+                    name,
+                    convId,
+                    dataIndex,
+                    message: getConversationMessage(el),
+                    time: getConversationTime(el),
+                });
+            }
+
+            map.get(key).sources.add(source);
+        }
+
+        const targetMap = new Map();
+
+        // Method 1: detect pinned conversations by pin icon path.
+        const pinnedItems = [...document.querySelectorAll("path")]
+            .filter(path => path.getAttribute("d")?.startsWith(PIN_PATH_D))
+            .map(path => findConversationItemFromPath(path))
+            .filter(Boolean);
+
+        for (const el of pinnedItems) {
+            addUniqueTarget(targetMap, el, "pin");
+        }
+
+        // Method 2: detect target conversations by class key.
+        const conversationItems = [...document.querySelectorAll('[data-e2e="dm-new-conversation-item"]')];
+
+        for (const el of conversationItems) {
+            const className = String(el.className || "");
+
+            if (className.includes(TARGET_CLASS_KEY)) {
+                addUniqueTarget(targetMap, el, "class");
+            }
+        }
+
+        return [...targetMap.values()].map((item, index) => {
+            return {
+                index,
+                id: item.el.id || "",
+                convId: item.convId || "",
+                dataIndex: item.dataIndex || "",
+                name: item.name || "",
+                message: item.message || "",
+                time: item.time || "",
+                source: [...item.sources].join("+"),
+            };
+        });
         """
     )
 
@@ -462,25 +570,28 @@ def log_collected_targets(targets: list[dict]) -> None:
     print(color_text("Collected targets:", "96;1"))
     print(color_text("------------------", "90"))
 
-    for index, target in enumerate(targets, start=1):
+    for index, target in enumerate(send_targets, start=1):
         name = target.get("name", "")
         target_id = target.get("id", "")
         target_index = target.get("index", "")
+        target_source = target.get("source", "")
 
         logging.info(
-            "Target %s: name=%s id=%s index=%s",
+            "Target %s: name=%s id=%s index=%s source=%s",
             index,
             name,
             target_id,
             target_index,
+            target_source,
         )
 
         number_part = color_text(f"{index}.", "93;1")
         name_part = color_text(name, "92;1")
         id_part = color_text(f"id={target_id}", "94")
         index_part = color_text(f"index={target_index}", "95")
-
-        print(f"{number_part} {name_part} | {id_part} | {index_part}")
+        source_part = color_text(f"source={target_source}", "96")
+        
+        print(f"{number_part} {name_part} | {id_part} | {index_part} | {source_part}")
 
     print(color_text("------------------", "90"))
     print("")
@@ -488,55 +599,101 @@ def log_collected_targets(targets: list[dict]) -> None:
 
 def click_chat_by_target(driver: webdriver.Chrome, target: dict) -> None:
     target_id = target.get("id", "")
+    target_conv_id = target.get("convId", "")
     target_name = target.get("name", "")
     target_data_index = target.get("dataIndex", "")
 
     clicked = driver.execute_script(
         """
         const targetId = arguments[0];
-        const targetName = arguments[1];
-        const targetDataIndex = arguments[2];
+        const targetConvId = arguments[1];
+        const targetName = arguments[2];
+        const targetDataIndex = arguments[3];
 
-        const pinPathD = "M31.6 3.67a3 3 0 0 0-4.24 0l-.7.7";
+        const PIN_PATH_D = "M31.6 3.67a3 3 0 0 0-4.24 0l-.7.7";
 
-        const pinnedItems = [...document.querySelectorAll("path")]
-            .filter(path => path.getAttribute("d")?.startsWith(pinPathD))
-            .map(path => {
-                return path.closest('[data-e2e="dm-new-conversation-item"]')
-                    || path.closest('[data-index]')
-                    || path.closest('div');
-            })
-            .filter(Boolean);
+        const TARGET_CLASS_KEY = "css-k8n8bd";
 
-        const uniqueItems = [];
-        const seen = new Set();
+        function getConversationName(el) {
+            return el.querySelector('[data-e2e="dm-new-conversation-nickname"]')
+                ?.innerText
+                ?.trim() || "";
+        }
 
-        for (const el of pinnedItems) {
-            const key = el.id || el.getAttribute("data-index") || el.outerHTML.slice(0, 200);
+        function getConversationId(el) {
+            return el.getAttribute("data-conv-id")
+                || el.id
+                || el.getAttribute("data-index")
+                || "";
+        }
 
-            if (seen.has(key)) {
-                continue;
+        function findConversationItemFromPath(path) {
+            return path.closest('[data-e2e="dm-new-conversation-item"]')
+                || path.closest('[data-index]')
+                || path.closest('div');
+        }
+
+        function addUniqueItem(map, el) {
+            if (!el) {
+                return;
             }
 
-            seen.add(key);
-            uniqueItems.push(el);
+            const name = getConversationName(el);
+
+            if (!name) {
+                return;
+            }
+
+            const convId = getConversationId(el);
+            const dataIndex = el.getAttribute("data-index") || "";
+            const key = convId || dataIndex || name;
+
+            if (!map.has(key)) {
+                map.set(key, el);
+            }
         }
+
+        const itemMap = new Map();
+
+        // Method 1: pinned icon.
+        const pinnedItems = [...document.querySelectorAll("path")]
+            .filter(path => path.getAttribute("d")?.startsWith(PIN_PATH_D))
+            .map(path => findConversationItemFromPath(path))
+            .filter(Boolean);
+
+        for (const el of pinnedItems) {
+            addUniqueItem(itemMap, el);
+        }
+
+        // Method 2: class key.
+        const conversationItems = [...document.querySelectorAll('[data-e2e="dm-new-conversation-item"]')];
+
+        for (const el of conversationItems) {
+            const className = String(el.className || "");
+
+            if (className.includes(TARGET_CLASS_KEY)) {
+                addUniqueItem(itemMap, el);
+            }
+        }
+
+        const items = [...itemMap.values()];
 
         let item = null;
 
         if (targetId) {
-            item = uniqueItems.find(el => el.id === targetId);
+            item = items.find(el => el.id === targetId);
+        }
+
+        if (!item && targetConvId) {
+            item = items.find(el => el.getAttribute("data-conv-id") === targetConvId);
         }
 
         if (!item && targetDataIndex) {
-            item = uniqueItems.find(el => el.getAttribute("data-index") === targetDataIndex);
+            item = items.find(el => el.getAttribute("data-index") === targetDataIndex);
         }
 
         if (!item && targetName) {
-            item = uniqueItems.find(el => {
-                const nameEl = el.querySelector('[data-e2e="dm-new-conversation-nickname"]');
-                return nameEl && nameEl.textContent.trim() === targetName;
-            });
+            item = items.find(el => getConversationName(el) === targetName);
         }
 
         if (!item) {
@@ -568,6 +725,7 @@ def click_chat_by_target(driver: webdriver.Chrome, target: dict) -> None:
         return true;
         """,
         target_id,
+        target_conv_id,
         target_name,
         target_data_index,
     )
@@ -930,25 +1088,49 @@ def open_tiktok_with_cookies(
 
             raise TimeoutException("No target conversations found")
 
+        send_targets, excluded_targets = split_targets_by_exception(targets)
+        
+        if excluded_targets:
+            excluded_names = ", ".join(target.get("name", "") for target in excluded_targets)
+            logging.info(
+                "Excluded target count: %s. Names: %s",
+                len(excluded_targets),
+                excluded_names,
+            )
+        
         if DEBUG_MODE:
             log_collected_targets(targets)
-
+        
             target_names = ", ".join(target.get("name", "") for target in targets)
-
+            send_names = ", ".join(target.get("name", "") for target in send_targets) or "(none)"
+            excluded_names = ", ".join(target.get("name", "") for target in excluded_targets) or "(none)"
+        
             notify(
                 "Target collection succeeded.\n"
-                f"Targets: {len(targets)}\n"
-                f"Names: {target_names}"
+                f"Pinned targets: {len(targets)}\n"
+                f"Will send: {len(send_targets)}\n"
+                f"Excluded: {len(excluded_targets)}\n"
+                f"Target names: {target_names}\n"
+                f"Send names: {send_names}\n"
+                f"Excluded names: {excluded_names}"
             )
-
+        
             logging.info("DEBUG_MODE=True, message sending skipped.")
             return
+        
+        if not send_targets:
+            notify(
+                "✅ TikTok bot completed\n"
+                "No messages were sent because all pinned targets are in exception.txt."
+            )
+            logging.info("All pinned targets are excluded. No messages will be sent.")
+            return
 
-        for index, target in enumerate(targets, start=1):
+        for index, target in enumerate(send_targets, start=1):
             logging.info(
                 "Opening target conversation %s/%s: %s",
                 index,
-                len(targets),
+                len(send_targets),
                 target["name"],
             )
 
